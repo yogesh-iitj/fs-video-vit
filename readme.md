@@ -168,24 +168,9 @@ The model is evaluated using Average Precision (AP) metrics:
 - **AP50**: Average precision at 50% IoU threshold
 - **AP75**: Average precision at 75% IoU threshold
 
-## Citation
 
-If you use this code in your research, please cite our paper:
-
-```
-@inproceedings{fsvod2023,
-  title={Object-Aware Temporally Consistent Few-Shot Video Object Detection},
-  author={Your Name},
-  booktitle={Conference},
-  year={2023}
-}
-```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgements
 
 - This implementation uses the [Hugging Face Transformers](https://github.com/huggingface/transformers) library for pretrained OWL-ViT models.
-- The temporal consistency mechanism is inspired by recent works in video object detection.
+
