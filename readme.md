@@ -1,0 +1,191 @@
+# Few-Shot Video Object Detection (FSVOD)
+
+This repository contains the implementation of an Object-Aware Temporally Consistent Few-Shot Video Object Detection framework. The model combines a language-aligned vision encoder with a temporal fusion decoder that selectively propagates high-confidence object features across video frames, allowing efficient detection of novel object categories with only a few examples.
+
+## Features
+
+- **Few-shot learning**: Detect novel object categories with only a few examples (N-way, K-shot)
+- **Temporal consistency**: Maintain consistent object detection across video frames
+- **Object-aware feature propagation**: Selectively propagate high-confidence object features to reduce noise accumulation
+- **Language-aligned vision encoder**: Leverage semantic knowledge from large-scale pretrained vision-language models
+- **Parallel classification and detection heads**: Efficient object detection and classification
+
+## Project Structure
+
+```
+├── config.py                # Configuration parameters
+├── dataloader.py            # Few-shot video dataset and dataloader
+├── evaluate.py              # Evaluation script for test set
+├── inference.py             # Inference script for processing videos
+├── model.py                 # Main model architecture
+├── train.py                 # Training script
+└── utils.py                 # Utility functions
+```
+
+## Requirements
+
+- Python 3.8+
+- PyTorch 1.12+
+- torchvision
+- transformers
+- opencv-python
+- Pillow
+- numpy
+- tqdm
+- matplotlib
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Dataset Format
+
+The dataset should be organized as follows:
+
+```
+dataset_root/
+├── videos/
+│   ├── video1/
+│   │   ├── frame1.jpg
+│   │   ├── frame2.jpg
+│   │   └── ...
+│   ├── video2/
+│   │   └── ...
+│   └── ...
+├── train_annotations.json
+├── val_annotations.json
+└── test_annotations.json
+```
+
+Each annotation file should contain information about videos, frames, and objects in the following format:
+
+```json
+{
+  "video1": {
+    "frames": {
+      "frame1": {
+        "objects": [
+          {
+            "category_id": "class1",
+            "bbox": [x1, y1, x2, y2]
+          },
+          ...
+        ]
+      },
+      "frame2": {
+        ...
+      }
+    }
+  },
+  "video2": {
+    ...
+  }
+}
+```
+
+## Training
+
+To train the model:
+
+```bash
+python train.py \
+  --data_dir /path/to/dataset \
+  --n_way 5 \
+  --k_shot 5 \
+  --max_frames 16 \
+  --pretrained_model google/owlv2-large-patch16 \
+  --conf_threshold 0.5 \
+  --temporal_threshold 0.94 \
+  --batch_size 1 \
+  --epochs 50 \
+  --lr 1e-5 \
+  --weight_decay 0.01 \
+  --lambda_cls 2.0 \
+  --lambda_box 5.0 \
+  --img_size 640 \
+  --output_dir outputs
+```
+
+## Evaluation
+
+To evaluate the model on the test set:
+
+```bash
+python evaluate.py \
+  --data_dir /path/to/dataset \
+  --n_way 5 \
+  --k_shot 5 \
+  --checkpoint_path outputs/best_model.pt \
+  --pretrained_model google/owlv2-large-patch16 \
+  --conf_threshold 0.5 \
+  --temporal_threshold 0.94 \
+  --visualize \
+  --plot_results
+```
+
+## Inference
+
+To run inference on a video:
+
+```bash
+python inference.py \
+  --video_path /path/to/video.mp4 \
+  --support_folder /path/to/support_images \
+  --output_path output_video.mp4 \
+  --checkpoint_path outputs/best_model.pt \
+  --pretrained_model google/owlv2-large-patch16 \
+  --conf_threshold 0.5
+```
+
+The support folder should be organized as follows, with one subfolder per class:
+
+```
+support_images/
+├── class1/
+│   ├── image1.jpg
+│   ├── image2.jpg
+│   └── ...
+├── class2/
+│   └── ...
+└── ...
+```
+
+## Implementation Details
+
+- **Vision Encoder**: OWL-ViT L/16 pretrained with CLIP
+- **Temporal Fusion**: 4-head cross-attention with 1024-dimensional hidden states
+- **Classification/Localization Heads**: 2-layer MLPs with 512-dimensional hidden states
+- **Optimization**: AdamW with 1e-5 learning rate, 0.01 weight decay, cosine scheduling
+- **Loss Weighting**: λ_cls=2.0, λ_box=5.0
+- **Thresholds**: τ=0.94, κ=0.98
+
+## Performance Metrics
+
+The model is evaluated using Average Precision (AP) metrics:
+- **AP**: Average precision across all IoU thresholds
+- **AP50**: Average precision at 50% IoU threshold
+- **AP75**: Average precision at 75% IoU threshold
+
+## Citation
+
+If you use this code in your research, please cite our paper:
+
+```
+@inproceedings{fsvod2023,
+  title={Object-Aware Temporally Consistent Few-Shot Video Object Detection},
+  author={Your Name},
+  booktitle={Conference},
+  year={2023}
+}
+```
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+- This implementation uses the [Hugging Face Transformers](https://github.com/huggingface/transformers) library for pretrained OWL-ViT models.
+- The temporal consistency mechanism is inspired by recent works in video object detection.
