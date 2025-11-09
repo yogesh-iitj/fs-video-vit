@@ -150,7 +150,7 @@ support_images/
 If you find this work useful, please consider citing it as:
 ```bibtex
 @inproceedings{kumar2026fsvit,
-  title={Aligning Moments in Time using Video Queries},
+  title={Temporal Object-Aware Vision Transformer for Few-Shot Video Object Detection},
   author={Yogesh Kumar and Anand Mishra},
   booktitle={Association for the Advancement of Artificial Intelligence, AAAI},
   year={2026},
