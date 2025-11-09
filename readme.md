@@ -1,14 +1,7 @@
-# Few-Shot Video Object Detection (FSVOD)
+# Temporal Object-Aware Vision Transformer for Few-Shot Video Object Detection [AAAI 26]
 
-This repository contains the implementation of an Object-Aware Temporally Consistent Few-Shot Video Object Detection framework. The model combines a language-aligned vision encoder with a temporal fusion decoder that selectively propagates high-confidence object features across video frames, allowing efficient detection of novel object categories with only a few examples.
+This repository contains the implementation of an Object-Aware Temporally Consistent Few-Shot Video Object Detection framework. 
 
-## Features
-
-- **Few-shot learning**: Detect novel object categories with only a few examples (N-way, K-shot)
-- **Temporal consistency**: Maintain consistent object detection across video frames
-- **Object-aware feature propagation**: Selectively propagate high-confidence object features to reduce noise accumulation
-- **Language-aligned vision encoder**: Leverage semantic knowledge from large-scale pretrained vision-language models
-- **Parallel classification and detection heads**: Efficient object detection and classification
 
 ## Project Structure
 
