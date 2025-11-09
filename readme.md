@@ -145,22 +145,17 @@ support_images/
 └── ...
 ```
 
-## Implementation Details
 
-- **Vision Encoder**: OWL-ViT L/16 pretrained with CLIP
-- **Temporal Fusion**: 4-head cross-attention with 1024-dimensional hidden states
-- **Classification/Localization Heads**: 2-layer MLPs with 512-dimensional hidden states
-- **Optimization**: AdamW with 1e-5 learning rate, 0.01 weight decay, cosine scheduling
-- **Loss Weighting**: λ_cls=2.0, λ_box=5.0
-- **Thresholds**: τ=0.94, κ=0.98
-
-## Performance Metrics
-
-The model is evaluated using Average Precision (AP) metrics:
-- **AP**: Average precision across all IoU thresholds
-- **AP50**: Average precision at 50% IoU threshold
-- **AP75**: Average precision at 75% IoU threshold
-
+## Citation
+If you find this work useful, please consider citing it as:
+```bibtex
+@inproceedings{kumar2026fsvit,
+  title={Aligning Moments in Time using Video Queries},
+  author={Yogesh Kumar and Anand Mishra},
+  booktitle={Association for the Advancement of Artificial Intelligence, AAAI},
+  year={2026},
+}
+```
 
 
 ## Acknowledgements
