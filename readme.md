@@ -1,4 +1,8 @@
-# Temporal Object-Aware Vision Transformer for Few-Shot Video Object Detection ([Paper](https://github.com/yogesh-iitj/fs-video-vit/blob/main/kumar_aaai'26.pdf))
+# Temporal Object-Aware Vision Transformer for Few-Shot Video Object Detection
+
+[![AAAI'26 (PDF)](https://img.shields.io/badge/Paper-AAAI'26-blue)](https://github.com/yogesh-iitj/fs-video-vit/blob/main/kumar_aaai'26.pdf)
+[![arXiv](https://img.shields.io/badge/arXiv-2602.07801-red)](https://arxiv.org/pdf/2511.13784)
+
 
 This repository contains the implementation of an Object-Aware Temporally Consistent Few-Shot Video Object Detection framework. 
 
