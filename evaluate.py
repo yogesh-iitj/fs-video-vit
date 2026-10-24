@@ -1,308 +1,264 @@
 import os
+import time
 import torch
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
-import cv2
 
-from model import FewShotVideoObjectDetection
-from dataloader import get_fsvod_loaders
-from utils import calculate_map, calculate_map_at_iou
+from model import load_model_from_checkpoint
+from dataloader import get_fsvod_loader
+from utils import DetectionAccumulator, owl_unnormalize
 
-def visualize_detections(frame, detections, class_colors, output_path=None, threshold=0.5):
+
+def autocast_context(device, enabled):
+    if enabled and device.type == 'cuda':
+        return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def visualize_detections(frame, detections, class_names, class_colors, output_path=None, threshold=0.5):
     """
     Visualize detections on a frame
-    
+
     Args:
         frame: PIL Image object
-        detections: Dictionary with 'boxes', 'scores', 'labels'
-        class_colors: Dictionary mapping class IDs to colors
+        detections: Dictionary with 'boxes' (xyxy pixels), 'scores', 'labels' (class index)
+        class_names: List mapping class index to a name
+        class_colors: List mapping class index to a color
         output_path: Path to save visualization (optional)
         threshold: Confidence threshold for visualization
-    
+
     Returns:
         Visualization as PIL Image
     """
-    # Create a copy of the frame
     img = frame.copy()
     draw = ImageDraw.Draw(img)
-    
-    # Get frame dimensions
-    width, height = img.size
-    
-    # Try to load a font
-    try:
-        font = ImageFont.truetype("arial.ttf", 15)
-    except IOError:
-        font = ImageFont.load_default()
-    
-    # Draw each detection
-    for box, score, label in zip(detections['boxes'], detections['scores'], detections['labels']):
+    font = ImageFont.load_default()
+
+    for box, score, label in zip(detections['boxes'].tolist(), detections['scores'].tolist(),
+                                 detections['labels'].tolist()):
         if score < threshold:
             continue
-        
-        # Get color for this class
-        color = class_colors.get(label, (255, 0, 0))
-        
-        # Convert box coordinates to integers
+        color = class_colors[label]
         x1, y1, x2, y2 = map(int, box)
-        
-        # Ensure coordinates are within image bounds
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(0, min(x2, width - 1))
-        y2 = max(0, min(y2, height - 1))
-        
-        # Draw rectangle
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-        
-        # Draw label
-        label_text = f"{label}: {score:.2f}"
-        text_w, text_h = draw.textsize(label_text, font=font)
-        draw.rectangle([x1, y1, x1 + text_w, y1 + text_h], fill=color)
+        label_text = f"{class_names[label]}: {score:.2f}"
+        tx1, ty1, tx2, ty2 = draw.textbbox((x1, y1), label_text, font=font)
+        draw.rectangle([tx1, ty1, tx2, ty2], fill=color)
         draw.text((x1, y1), label_text, fill=(255, 255, 255), font=font)
-    
-    # Save image if output path is provided
+
     if output_path:
         img.save(output_path)
-    
     return img
 
+
+@torch.no_grad()
+def run_evaluation(model, data_loader, device, amp=True, score_threshold=0.0, max_detections=100,
+                   nms_iou=None, per_class=False, desc="Evaluating", vis_dir=None, num_vis_episodes=0,
+                   vis_threshold=None, category_names=None):
+    """
+    Run the model over fixed evaluation episodes and compute COCO-style AP / AP50 / AP75.
+
+    Returns:
+        dict with AP, AP50, AP75 (%), counts, avg_memory_tokens, fps (and per_class)
+    """
+    model.eval()
+    accumulator = DetectionAccumulator()
+    memory_tokens = []
+    num_frames = 0
+    start = time.time()
+    rng = np.random.RandomState(42)
+    category_names = category_names or {}
+
+    for i, batch in enumerate(tqdm(data_loader, desc=desc)):
+        if not batch['targets']:
+            continue
+        support = batch['support_pixel_values'].to(device, non_blocking=True)
+        support_labels = batch['support_labels'].to(device)
+        query = batch['query_pixel_values'].to(device, non_blocking=True)
+        classes = batch['classes']
+
+        with autocast_context(device, amp):
+            outputs = model(query, support, support_labels, num_classes=len(classes))
+
+        for t, (frame_output, target) in enumerate(zip(outputs, batch['targets'])):
+            image_size = batch['image_sizes'][t]
+            detections = model.postprocess_detections(
+                frame_output, image_size,
+                confidence_threshold=score_threshold,
+                max_detections=max_detections,
+                nms_iou=nms_iou
+            )
+            accumulator.add_frame(
+                image_size,
+                target['boxes_xyxy'].tolist(), target['category_ids'],
+                detections['boxes'].tolist(), detections['scores'].tolist(),
+                [classes[label] for label in detections['labels'].tolist()]
+            )
+            memory_tokens.append(int(frame_output['num_memory'][0]))
+
+            if vis_dir is not None and i < num_vis_episodes:
+                frame = owl_unnormalize(query[t].float().cpu())
+                frame = Image.fromarray((frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+                h, w = image_size
+                side = max(h, w)
+                frame = frame.resize((side, side)).crop((0, 0, w, h))
+                names = [category_names.get(c, c) for c in classes]
+                colors = [tuple(rng.randint(0, 255, 3).tolist()) for _ in classes]
+                visualize_detections(
+                    frame, detections, names, colors,
+                    output_path=Path(vis_dir) / f"episode_{i}_frame_{t}.jpg",
+                    threshold=model.confidence_threshold if vis_threshold is None else vis_threshold
+                )
+        num_frames += len(outputs)
+
+    elapsed = time.time() - start
+    results = accumulator.summarize(per_class=per_class)
+    results['avg_memory_tokens'] = float(np.mean(memory_tokens)) if memory_tokens else 0.0
+    results['num_episodes'] = len(data_loader)
+    results['fps'] = num_frames / max(elapsed, 1e-6)
+    return results
+
+
 def evaluate_model(args):
-    """Evaluate model on test set"""
-    # Set device
+    """Evaluate model on the test set"""
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu")
     print(f"Using device: {device}")
-    
-    # Create output directory
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create visualization directory if needed
+    vis_dir = None
     if args.visualize:
         vis_dir = output_dir / "visualizations"
         vis_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load test data
-    data_loaders = get_fsvod_loaders(
+
+    if args.checkpoint_path is None:
+        print("No checkpoint given: evaluating the untrained model (pretrained OWLv2 heads)")
+    model = load_model_from_checkpoint(
+        args.checkpoint_path, device,
+        pretrained_model_name=args.pretrained_model,
+        confidence_threshold=args.conf_threshold,
+        temporal_confidence_threshold=args.temporal_threshold,
+        use_temporal=False if args.no_temporal else None
+    )
+    model.eval()
+    print(f"Model: {model.owl.name_or_path}, temporal fusion: {model.use_temporal}, "
+          f"tau={model.temporal_confidence_threshold}, kappa={model.confidence_threshold}")
+
+    test_loader = get_fsvod_loader(
         root_dir=args.data_dir,
+        split=args.split,
         n_way=args.n_way,
         k_shot=args.k_shot,
         max_frames=args.max_frames,
-        batch_size=1,
+        frame_stride=args.frame_stride,
+        image_size=model.image_size,
         num_workers=args.num_workers,
-        target_size=(args.img_size, args.img_size)
+        seed=args.seed,
+        max_videos=args.max_videos
     )
-    test_loader = data_loaders['test']
-    
-    # Load model
-    model = FewShotVideoObjectDetection(
-        pretrained_model_name=args.pretrained_model,
-        confidence_threshold=args.conf_threshold,
-        temporal_confidence_threshold=args.temporal_threshold
+    print(f"{args.split}: {len(test_loader.dataset.videos)} videos, {len(test_loader.dataset.all_classes)} classes, "
+          f"{len(test_loader)} episodes ({args.n_way}-way {args.k_shot}-shot)")
+
+    category_names = {}
+    names_file = Path(args.data_dir) / "categories.json"
+    if names_file.exists():
+        with open(names_file) as f:
+            category_names = json.load(f)
+
+    results = run_evaluation(
+        model, test_loader, device,
+        amp=not args.no_amp,
+        score_threshold=args.score_threshold,
+        max_detections=args.max_detections,
+        nms_iou=args.nms_iou,
+        per_class=True,
+        vis_dir=vis_dir,
+        num_vis_episodes=args.num_vis_episodes,
+        category_names=category_names
     )
-    
-    # Load checkpoint
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model'])
-    model.to(device)
-    model.eval()
-    
-    print(f"Loaded checkpoint from {args.checkpoint_path}")
-    
-    # For mAP calculation
-    all_detections = []
-    all_annotations = []
-    
-    # For per-class mAP
-    class_detections = {}
-    class_annotations = {}
-    
-    # Random colors for visualization
-    np.random.seed(42)
-    class_colors = {}
-    
-    # Evaluate on test set
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_loader, desc="Evaluating")):
-            # Get data
-            support_images = {cls_id: imgs.to(device) for cls_id, imgs in batch['support_images'].items()}
-            query_frames = batch['query_frames'].to(device)
-            annotations = batch['frame_annotations']
-            classes = batch['classes']
-            
-            # Create colors for classes
-            for cls_id in classes:
-                if cls_id not in class_colors:
-                    class_colors[cls_id] = tuple(np.random.randint(0, 255, 3).tolist())
-            
-            # Forward pass
-            outputs = model(
-                frames=query_frames,
-                support_images=support_images,
-                return_all_frames=True
-            )
-            
-            # Process each frame
-            for t, (frame_output, frame_anno) in enumerate(zip(outputs, annotations)):
-                # Get image size
-                image_size = query_frames[t].shape[-2:]  # H, W
-                
-                # Get post-processed detections
-                detections = model.postprocess_detections(
-                    frame_output,
-                    image_size,
-                    confidence_threshold=args.conf_threshold
-                )
-                
-                # Prepare ground truth annotations
-                gt_boxes = []
-                gt_classes = []
-                
-                for obj in frame_anno['objects']:
-                    gt_boxes.append(obj['bbox'])
-                    gt_classes.append(obj['category_id'])
-                
-                # Append to lists for mAP calculation
-                all_detections.append(detections)
-                all_annotations.append({
-                    'boxes': gt_boxes,
-                    'labels': gt_classes
-                })
-                
-                # Update per-class detections and annotations
-                for cls_id in classes:
-                    # Filter detections for this class
-                    cls_dets = {
-                        'boxes': [box for box, lbl in zip(detections['boxes'], detections['labels']) if lbl == cls_id],
-                        'scores': [score for score, lbl in zip(detections['scores'], detections['labels']) if lbl == cls_id],
-                        'labels': [lbl for lbl in detections['labels'] if lbl == cls_id]
-                    }
-                    
-                    # Filter annotations for this class
-                    cls_annos = {
-                        'boxes': [box for box, lbl in zip(gt_boxes, gt_classes) if lbl == cls_id],
-                        'labels': [lbl for lbl in gt_classes if lbl == cls_id]
-                    }
-                    
-                    # Initialize lists if needed
-                    if cls_id not in class_detections:
-                        class_detections[cls_id] = []
-                        class_annotations[cls_id] = []
-                    
-                    # Append to lists
-                    class_detections[cls_id].append(cls_dets)
-                    class_annotations[cls_id].append(cls_annos)
-                
-                # Visualize if requested
-                if args.visualize and i < args.num_vis_episodes:
-                    # Convert tensor to PIL image
-                    frame_tensor = query_frames[t].cpu()
-                    frame_tensor = frame_tensor * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    frame_tensor = frame_tensor + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    frame_tensor = frame_tensor.clamp(0, 1)
-                    
-                    frame_np = (frame_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    frame_pil = Image.fromarray(frame_np)
-                    
-                    # Visualize detections
-                    vis_img = visualize_detections(
-                        frame=frame_pil,
-                        detections=detections,
-                        class_colors=class_colors,
-                        output_path=vis_dir / f"episode_{i}_frame_{t}.jpg",
-                        threshold=args.conf_threshold
-                    )
-    
-    # Calculate overall mAP at different IoU thresholds
-    mAP_results = calculate_map_at_iou(
-        all_detections, 
-        all_annotations,
-        iou_thresholds=[0.5, 0.75]
-    )
-    
-    print("\nOverall mAP Results:")
-    for k, v in mAP_results.items():
-        print(f"{k}: {v:.4f}")
-    
-    # Calculate per-class mAP
-    per_class_results = {}
-    for cls_id in class_detections.keys():
-        cls_map = calculate_map(class_detections[cls_id], class_annotations[cls_id])
-        per_class_results[cls_id] = cls_map
-    
-    print("\nPer-class mAP Results:")
-    for cls_id, mAP in per_class_results.items():
-        print(f"Class {cls_id}: {mAP:.4f}")
-    
-    # Save results
-    results = {
-        'overall': mAP_results,
-        'per_class': per_class_results
-    }
-    
+    per_class = {category_names.get(k, k): v for k, v in results.pop('per_class', {}).items()}
+
+    print("\nOverall results:")
+    for k in ['AP', 'AP50', 'AP75']:
+        print(f"{k}: {results[k]:.2f}")
+    print(f"frames/s: {results['fps']:.2f}, avg. propagated object tokens: {results['avg_memory_tokens']:.2f}")
+
+    print("\nPer-class AP:")
+    for cls_name, ap in sorted(per_class.items(), key=lambda kv: -kv[1]):
+        print(f"{cls_name}: {ap:.2f}")
+
+    all_results = {'overall': results, 'per_class': per_class, 'args': vars(args)}
     with open(output_dir / "evaluation_results.json", 'w') as f:
-        json.dump(results, f, indent=4)
-    
+        json.dump(all_results, f, indent=4)
     print(f"\nResults saved to {output_dir / 'evaluation_results.json'}")
-    
-    # Plot mAP results
+
     if args.plot_results:
-        # Plot overall mAP
-        plt.figure(figsize=(10, 6))
-        plt.bar(mAP_results.keys(), mAP_results.values())
-        plt.title('Overall mAP at different IoU thresholds')
-        plt.ylabel('mAP')
-        plt.savefig(output_dir / "overall_map.png")
-        
-        # Plot per-class mAP
-        plt.figure(figsize=(12, 6))
-        plt.bar(per_class_results.keys(), per_class_results.values())
-        plt.title('Per-class mAP')
-        plt.xlabel('Class ID')
-        plt.ylabel('mAP')
-        plt.savefig(output_dir / "per_class_map.png")
-    
-    return results
+        plt.figure(figsize=(6, 4))
+        plt.bar(['AP', 'AP50', 'AP75'], [results['AP'], results['AP50'], results['AP75']])
+        plt.title('Overall AP')
+        plt.ylabel('AP (%)')
+        plt.savefig(output_dir / "overall_map.png", bbox_inches='tight')
+
+        names = sorted(per_class, key=lambda k: -per_class[k])
+        plt.figure(figsize=(max(8, 0.3 * len(names)), 5))
+        plt.bar(names, [per_class[n] for n in names])
+        plt.xticks(rotation=90)
+        plt.title('Per-class AP')
+        plt.ylabel('AP (%)')
+        plt.savefig(output_dir / "per_class_map.png", bbox_inches='tight')
+
+    return all_results
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Few-Shot Video Object Detection Model")
-    
+
     # Dataset parameters
     parser.add_argument('--data_dir', type=str, required=True, help="Dataset root directory")
+    parser.add_argument('--split', type=str, default='test', help="Split to evaluate")
     parser.add_argument('--n_way', type=int, default=5, help="Number of classes per episode")
     parser.add_argument('--k_shot', type=int, default=5, help="Number of examples per class")
-    parser.add_argument('--max_frames', type=int, default=16, help="Maximum number of frames per video")
-    
+    parser.add_argument('--max_frames', type=int, default=0, help="Frames per video (0 = all annotated frames)")
+    parser.add_argument('--frame_stride', type=int, default=1, help="Stride over annotated frames")
+    parser.add_argument('--max_videos', type=int, default=0, help="Evaluate at most this many videos (0 = all)")
+
     # Model parameters
-    parser.add_argument('--pretrained_model', type=str, default="google/owlv2-large-patch16",
-                       help="Pretrained model name or path")
-    parser.add_argument('--conf_threshold', type=float, default=0.5, 
-                       help="Confidence threshold for detections")
-    parser.add_argument('--temporal_threshold', type=float, default=0.94,
-                       help="Threshold for temporal propagation")
-    
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help="Model checkpoint (omit to evaluate the untrained model)")
+    parser.add_argument('--pretrained_model', type=str, default=None,
+                        help="Pretrained OWLv2 model (default: from checkpoint, else owlv2-large-patch14-ensemble)")
+    parser.add_argument('--conf_threshold', type=float, default=None,
+                        help="Detection threshold kappa for visualisation (default 0.98)")
+    parser.add_argument('--temporal_threshold', type=float, default=None,
+                        help="Threshold tau for temporal propagation (default 0.94)")
+    parser.add_argument('--no_temporal', action='store_true', help="Disable temporal fusion (ablation)")
+
     # Evaluation parameters
-    parser.add_argument('--checkpoint_path', type=str, required=True,
-                       help="Path to model checkpoint")
-    parser.add_argument('--img_size', type=int, default=640, help="Image size")
+    parser.add_argument('--score_threshold', type=float, default=0.0, help="Score threshold for AP evaluation")
+    parser.add_argument('--max_detections', type=int, default=100, help="Detections per frame")
+    parser.add_argument('--nms_iou', type=float, default=None, help="Class-wise NMS IoU (default: no NMS)")
     parser.add_argument('--num_workers', type=int, default=4, help="Number of data loading workers")
     parser.add_argument('--output_dir', type=str, default="evaluation_results", help="Output directory")
     parser.add_argument('--gpu', type=int, default=0, help="GPU ID, -1 for CPU")
-    
+    parser.add_argument('--no_amp', action='store_true', help="Disable bf16 autocast on GPU")
+    parser.add_argument('--seed', type=int, default=42, help="Seed for the evaluation episodes")
+
     # Visualization parameters
     parser.add_argument('--visualize', action='store_true', help="Visualize detections")
-    parser.add_argument('--num_vis_episodes', type=int, default=5,
-                       help="Number of episodes to visualize")
-    parser.add_argument('--plot_results', action='store_true', help="Plot mAP results")
-    
+    parser.add_argument('--num_vis_episodes', type=int, default=5, help="Number of episodes to visualize")
+    parser.add_argument('--plot_results', action='store_true', help="Plot AP results")
+
     args = parser.parse_args()
-    
     evaluate_model(args)
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+outputs/
+logs/
+data/
+evaluation_results/
+*.pt
+*.mp4

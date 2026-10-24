@@ -5,17 +5,17 @@ Configuration file for Few-Shot Video Object Detection
 class ModelConfig:
     """Model configuration parameters"""
     # Vision encoder
-    PRETRAINED_MODEL = "google/owlv2-large-patch16"  # Use OWL-ViT Large model
-    HIDDEN_SIZE = 1024  # Hidden dimension size
+    PRETRAINED_MODEL = "google/owlv2-large-patch14-ensemble"  # OWLv2 ViT-L/14 (1008px input)
+    HIDDEN_SIZE = 1024  # Hidden dimension size (D, from the encoder config)
     NUM_ATTENTION_HEADS = 4  # Number of attention heads in temporal decoder
     
     # Thresholds
-    CONFIDENCE_THRESHOLD = 0.5  # Confidence threshold for detections
     TEMPORAL_THRESHOLD = 0.94  # Threshold for temporal propagation (τ)
-    FILTERING_THRESHOLD = 0.98  # Threshold for filtering detections (κ)
+    FILTERING_THRESHOLD = 0.98  # Threshold for valid detections (κ, --conf_threshold)
+    MAX_MEMORY_TOKENS = 64  # Max object tokens propagated to the next frame
     
     # Decoder parameters
-    DROPOUT = 0.1  # Dropout rate in decoder
+    DROPOUT = 0.0  # Dropout rate in decoder
     
     # Whether to freeze the encoder
     FREEZE_ENCODER = True
@@ -27,16 +27,20 @@ class TrainingConfig:
     NUM_EPOCHS = 50  # Number of training epochs
     
     # Optimizer parameters
-    LEARNING_RATE = 1e-5  # Learning rate
+    LEARNING_RATE = 1e-5  # Learning rate (pretrained heads)
+    LEARNING_RATE_NEW = 1e-4  # Learning rate of the temporal decoder
+    LEARNING_RATE_BACKGROUND = 1e-2  # Learning rate of the background logit
     WEIGHT_DECAY = 0.01  # Weight decay
     
     # Scheduler parameters
-    LR_WARMUP_EPOCHS = 5  # Number of warmup epochs
+    LR_WARMUP_EPOCHS = 1  # Number of warmup epochs
     LR_MIN_FACTOR = 0.01  # Minimum learning rate factor
     
     # Loss weighting
     LAMBDA_CLS = 2.0  # Classification loss weight
-    LAMBDA_BOX = 5.0  # Box loss weight
+    LAMBDA_BOX = 5.0  # L1 box loss weight
+    LAMBDA_GIOU = 2.0  # GIoU loss weight
+    FOCAL_GAMMA = 2.0  # Focal modulation of the classification CE
     
     # Data augmentation
     USE_AUGMENTATION = True  # Whether to use data augmentation
@@ -51,11 +55,11 @@ class DataConfig:
     K_SHOT = 5  # Number of examples per class
     
     # Video parameters
-    MAX_FRAMES = 16  # Maximum number of frames per video
+    MAX_FRAMES = 8  # Frames per training clip
     FRAME_STRIDE = 1  # Stride for sampling frames
     
     # Image parameters
-    IMG_SIZE = 640  # Image size (H, W)
+    IMG_SIZE = 1008  # Model input size (set by the OWLv2 model: 960 for B/16, 1008 for L/14)
     
     # Dataset paths (to be filled by user)
     DATA_ROOT = "/path/to/dataset"
