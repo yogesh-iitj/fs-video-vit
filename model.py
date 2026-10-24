@@ -1,381 +1,418 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Owlv2Processor, Owlv2ForObjectDetection
-from typing import List, Tuple, Dict, Optional, Union
-import numpy as np
+from torchvision.ops import batched_nms
+from transformers import Owlv2ForObjectDetection
+from typing import List, Tuple, Dict, Optional
 
-class TemporalDecoder(nn.Module):
-    def __init__(self, hidden_size: int, num_attention_heads: int, dropout: float = 0.1):
+from utils import box_cxcywh_to_xyxy
+
+
+def _fused_attention_forward(self, hidden_states, attention_mask=None, causal_attention_mask=None,
+                             output_attentions=False):
+    """Owlv2Attention.forward with F.scaled_dot_product_attention (same math, no P x P matrices)"""
+    if attention_mask is not None or causal_attention_mask is not None or output_attentions:
+        return type(self).forward(self, hidden_states, attention_mask, causal_attention_mask, output_attentions)
+    bsz, seq_len, _ = hidden_states.shape
+    q, k, v = [proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+               for proj in (self.q_proj, self.k_proj, self.v_proj)]
+    out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
+    return self.out_proj(out.transpose(1, 2).reshape(bsz, seq_len, self.embed_dim)), None
+
+
+def _use_fused_attention(vision_model: nn.Module):
+    """transformers' OWLv2 has no SDPA path; the eager one materialises 16 x 5184^2 weights per layer"""
+    for module in vision_model.modules():
+        if type(module).__name__ == 'Owlv2Attention':
+            module.forward = _fused_attention_forward.__get__(module)
+
+
+class ObjectAwareTemporalDecoder(nn.Module):
+    """
+    Object-aware temporal fusion (Eq. 3-4 of the paper).
+
+    The current frame's patch embeddings F_t are the queries; the classification
+    embeddings of the previous frame's confident detections V^det_{t-1} (Eq. 2)
+    are the keys and values:
+
+        A_t = Softmax(F_t (V^det_{t-1})^T / sqrt(D)),    F^_t = F_t + A_t V^det_{t-1}
+
+    Implemented with multi-head cross-attention (4 heads in the paper). V^det lives in
+    the classification space (dim D_cls), so keys/values are projected to D. The output
+    projection is zero-initialised: at the start of training F^_t = F_t, i.e. the model
+    starts from the pretrained OWLv2 image-conditioned detector and learns how much
+    temporal context to add.
+    """
+    def __init__(self, hidden_size: int, memory_size: int, num_attention_heads: int = 4, dropout: float = 0.0):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.head_dim = hidden_size // num_attention_heads
-        
-        # Multi-head attention for temporal processing
-        self.temporal_attention = nn.MultiheadAttention(
+        self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
             num_heads=num_attention_heads,
             dropout=dropout,
+            kdim=memory_size,
+            vdim=memory_size,
             batch_first=True
         )
-        
-        # Layer norm and feedforward
-        self.layer_norm1 = nn.LayerNorm(hidden_size)
-        self.layer_norm2 = nn.LayerNorm(hidden_size)
-        
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Dropout(dropout)
-        )
+        nn.init.zeros_(self.cross_attention.out_proj.weight)
+        nn.init.zeros_(self.cross_attention.out_proj.bias)
 
-    def forward(self, 
+    def forward(self,
                 frame_embeddings: torch.Tensor,
-                prev_embeddings: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                memory: torch.Tensor,
+                memory_padding_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            frame_embeddings: Current frame embeddings [B, P, D]
-            prev_embeddings: Previous frame's embeddings (optional) [B, P', D]
-            attention_mask: Attention mask for temporal attention [B, P']
-            
+            frame_embeddings: Current frame embeddings F_t [B, P, D]
+            memory: Previous frame's confident object embeddings V^det_{t-1} [B, M, D_cls]
+            memory_padding_mask: True for padded memory slots [B, M]
+
         Returns:
-            enhanced_embeddings: Temporally enhanced embeddings [B, P, D]
+            enhanced_embeddings: F^_t [B, P, D]
         """
-        batch_size, num_patches, hidden_dim = frame_embeddings.shape
-        
-        # If no previous embeddings, use self-attention
-        if prev_embeddings is None:
-            prev_embeddings = frame_embeddings
-            
-        # Temporal multi-head attention
-        attn_output, _ = self.temporal_attention(
+        # Rows without any memory token would produce NaNs; give them a dummy key and zero output
+        empty = memory_padding_mask.all(dim=1)
+        if empty.any():
+            memory_padding_mask = memory_padding_mask.clone()
+            memory_padding_mask[empty, 0] = False
+
+        attn_output, _ = self.cross_attention(
             query=frame_embeddings,
-            key=prev_embeddings,
-            value=prev_embeddings,
-            key_padding_mask=attention_mask,
+            key=memory,
+            value=memory,
+            key_padding_mask=memory_padding_mask,
             need_weights=False
         )
-        
-        # Residual connection and layer norm
-        frame_embeddings = self.layer_norm1(frame_embeddings + attn_output)
-        
-        # Feedforward network
-        ffn_output = self.ffn(frame_embeddings)
-        enhanced_embeddings = self.layer_norm2(frame_embeddings + ffn_output)
-        
-        return enhanced_embeddings
+        attn_output = attn_output.masked_fill(empty[:, None, None], 0.0)
+        return frame_embeddings + attn_output
 
 
 class FewShotVideoObjectDetection(nn.Module):
+    """
+    Temporal Object-Aware Vision Transformer for Few-Shot Video Object Detection.
+
+    Components (paper section "Method"):
+      - Language-aligned vision encoder: frozen OWLv2 image encoder -> patch embeddings E in R^{P x D}
+      - Support set encoding: highest-objectness patch per support image (Eq. 1), averaged over
+        the K shots into a class prototype
+      - Object-aware temporal frame decoder (Eq. 2-4)
+      - Few-shot detection heads: classification projection W_cls + cosine similarity to the
+        prototypes + softmax over N classes and background (Eq. 5-6); box MLP (Eq. 7).
+        Both heads are initialised from the pretrained OWLv2 heads.
+    """
     def __init__(
         self,
-        pretrained_model_name: str = "google/owlv2-base-patch16-ensemble",
-        confidence_threshold: float = 0.7,
-        temporal_confidence_threshold: float = 0.85,
-        hidden_size: Optional[int] = None,
-        num_attention_heads: Optional[int] = None,
-        freeze_encoder: bool = True
+        pretrained_model_name: str = "google/owlv2-large-patch14-ensemble",
+        confidence_threshold: float = 0.98,
+        temporal_confidence_threshold: float = 0.94,
+        num_attention_heads: int = 4,
+        max_memory_tokens: int = 64,
+        use_temporal: bool = True,
+        detach_memory: bool = False,
+        freeze_encoder: bool = True,
+        encoder_chunk_size: int = 8
     ):
         super().__init__()
-        
-        # Initialize OWL-ViT processor and model
-        self.processor = Owlv2Processor.from_pretrained(pretrained_model_name)
-        self.owl_vit = Owlv2ForObjectDetection.from_pretrained(pretrained_model_name)
-        
-        # Get model config values if not provided
-        if hidden_size is None:
-            hidden_size = self.owl_vit.config.hidden_size
-        if num_attention_heads is None:
-            num_attention_heads = self.owl_vit.config.num_attention_heads
-            
-        # Add temporal decoder for frame-to-frame consistency
-        self.temporal_decoder = TemporalDecoder(
-            hidden_size=hidden_size,
+
+        self.owl = Owlv2ForObjectDetection.from_pretrained(pretrained_model_name)
+        _use_fused_attention(self.owl.owlv2.vision_model)
+        config = self.owl.config
+        self.image_size = config.vision_config.image_size
+        self.hidden_size = config.vision_config.hidden_size          # D
+        self.cls_embed_size = config.text_config.hidden_size         # D_cls (output of W_cls)
+
+        self.confidence_threshold = confidence_threshold                    # kappa
+        self.temporal_confidence_threshold = temporal_confidence_threshold  # tau
+        self.max_memory_tokens = max_memory_tokens
+        self.use_temporal = use_temporal
+        self.detach_memory = detach_memory
+        self.freeze_encoder = freeze_encoder
+        self.encoder_chunk_size = encoder_chunk_size
+
+        # Object-aware temporal decoder
+        self.temporal_decoder = ObjectAwareTemporalDecoder(
+            hidden_size=self.hidden_size,
+            memory_size=self.cls_embed_size,
             num_attention_heads=num_attention_heads
         )
-        
-        # Few-shot classification head
-        self.classification_head = nn.Linear(hidden_size, hidden_size)
-        
-        # Box regression head (reuse OWL-ViT's box head)
-        self.box_head = self.owl_vit.box_head
-        
-        # Thresholds
-        self.confidence_threshold = confidence_threshold
-        self.temporal_confidence_threshold = temporal_confidence_threshold
-        
-        # Freeze encoder parameters if specified
-        if freeze_encoder:
-            for param in self.owl_vit.owlv2.vision_model.parameters():
-                param.requires_grad = False
-    
-    def extract_features(self, images):
-        """Extract features from images using OWL-ViT encoder"""
-        inputs = self.processor(images=images, return_tensors="pt").to(next(self.parameters()).device)
-        
-        # Get image features
-        with torch.no_grad():
-            image_features = self.owl_vit.owlv2.vision_model(
-                inputs.pixel_values,
-                return_dict=True
-            ).last_hidden_state
-            
-        return image_features
-    
-    def process_support_set(self, support_images: List[Dict[str, List]]):
+
+        # Few-shot classification head (W_cls, logit shift/scale) and box head reuse OWLv2's
+        # pretrained heads; a learnable background logit turns the N cosine similarities
+        # into an (N + 1)-way softmax.
+        self.cls_head = self.owl.class_head
+        self.box_head = self.owl.box_head
+        self.background_logit = nn.Parameter(torch.zeros(1))
+
+        # Encoder (and the objectness head, only used to pick support patches) are frozen
+        for param in self.owl.owlv2.parameters():
+            param.requires_grad = not freeze_encoder
+        for param in self.owl.layer_norm.parameters():
+            param.requires_grad = not freeze_encoder
+        for param in self.owl.objectness_head.parameters():
+            param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_encoder:
+            self.owl.owlv2.eval()
+        return self
+
+    # ------------------------------------------------------------------
+    # Encoder
+    # ------------------------------------------------------------------
+    def encode_images(self, pixel_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Process support set to create class prototypes
-        
         Args:
-            support_images: Dict of support images organized by class
-                {class_id: [image1, image2, ...], ...}
-        
+            pixel_values: [B, 3, S, S] (see utils.owl_preprocess)
+
         Returns:
-            class_prototypes: Dict mapping class_id to class prototype embeddings
+            image_feats: Patch embeddings [B, P, D]
+            feature_map: Patch embeddings on the grid [B, h, w, D]
         """
-        class_prototypes = {}
-        
-        for class_id, images in support_images.items():
-            class_embeddings = []
-            
-            for image in images:
-                # Extract features
-                features = self.extract_features(image)
-                
-                # Get objectness scores
-                objectness_scores = self.owl_vit.class_head(features, is_training=False).logits.mean(dim=-1)
-                
-                # Select patch with highest objectness score
-                max_objectness_idx = objectness_scores.argmax(dim=1)
-                selected_embedding = features[torch.arange(features.size(0)), max_objectness_idx]
-                
-                class_embeddings.append(selected_embedding)
-            
-            # Create class prototype by averaging
-            class_prototype = torch.cat(class_embeddings).mean(dim=0)
-            class_prototypes[class_id] = F.normalize(class_prototype, p=2, dim=-1)
-        
-        return class_prototypes
-    
+        feature_maps = []
+        grad_context = torch.no_grad() if self.freeze_encoder else torch.enable_grad()
+        with grad_context:
+            for chunk in pixel_values.split(self.encoder_chunk_size):
+                feature_map, _ = self.owl.image_embedder(pixel_values=chunk)
+                feature_maps.append(feature_map)
+        feature_map = torch.cat(feature_maps)
+        b, h, w, d = feature_map.shape
+        return feature_map.reshape(b, h * w, d), feature_map
+
+    # ------------------------------------------------------------------
+    # Support set encoding
+    # ------------------------------------------------------------------
+    def compute_prototypes(self, support_pixel_values: torch.Tensor, support_labels: torch.Tensor,
+                           num_classes: int) -> torch.Tensor:
+        """
+        Support feature extraction (Eq. 1) and prototype generation.
+
+        Args:
+            support_pixel_values: [N*K, 3, S, S] support images (object crops)
+            support_labels: [N*K] episode class index of each support image
+            num_classes: N
+
+        Returns:
+            prototypes: [N, D] class prototypes z_i (encoder space)
+        """
+        support_feats, _ = self.encode_images(support_pixel_values)
+        objectness = self.owl.objectness_predictor(support_feats)               # [N*K, P]
+        best_patch = objectness.argmax(dim=-1)                                  # p*
+        z = support_feats[torch.arange(support_feats.size(0), device=support_feats.device), best_patch]
+        prototypes = torch.zeros(num_classes, z.size(-1), device=z.device, dtype=z.dtype)
+        prototypes.index_add_(0, support_labels, z)
+        counts = torch.bincount(support_labels, minlength=num_classes).clamp(min=1).to(z.dtype)
+        return prototypes / counts[:, None]
+
+    # ------------------------------------------------------------------
+    # Per-frame decoding
+    # ------------------------------------------------------------------
     def forward_frame(
         self,
-        frame_features: torch.Tensor,
-        class_prototypes: Dict[str, torch.Tensor],
-        prev_object_features: Optional[torch.Tensor] = None,
-        prev_object_mask: Optional[torch.Tensor] = None
-    ):
+        image_feats: torch.Tensor,
+        feature_map: torch.Tensor,
+        prototypes: torch.Tensor,
+        memory: Optional[torch.Tensor] = None,
+        memory_padding_mask: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
         """
-        Process a single frame with temporal context
-        
         Args:
-            frame_features: Current frame feature embeddings [B, P, D]
-            class_prototypes: Dict mapping class_id to prototype embeddings
-            prev_object_features: Previous frame's object features (optional)
-            prev_object_mask: Previous frame's object mask (optional)
-            
+            image_feats: Current frame patch embeddings F_t [B, P, D]
+            feature_map: Same embeddings on the grid [B, h, w, D] (for the box bias)
+            prototypes: Class prototypes [N, D]
+            memory: V^det_{t-1} [B, M, D_cls] or None (first frame / nothing confident)
+            memory_padding_mask: [B, M]
+
         Returns:
-            dict containing:
-                - cls_scores: Classification scores for each patch and class
-                - boxes: Predicted bounding boxes
-                - object_features: High-confidence object features for next frame
-                - object_mask: Mask for high-confidence object features
+            dict with
+                logits: [B, P, N + 1] (last index = background)
+                probs: [B, P, N + 1]
+                boxes: [B, P, 4] cxcywh, normalised to the padded square input
+                memory, memory_padding_mask: V^det_t for the next frame
+                num_memory: [B] number of propagated object tokens
         """
-        batch_size, num_patches, hidden_dim = frame_features.shape
-        
-        # Apply temporal decoder if we have previous frame information
-        if prev_object_features is not None and prev_object_mask is not None:
-            enhanced_features = self.temporal_decoder(
-                frame_embeddings=frame_features,
-                prev_embeddings=prev_object_features,
-                attention_mask=prev_object_mask
-            )
+        # Temporal fusion (t > 0)
+        if self.use_temporal and memory is not None:
+            enhanced_feats = self.temporal_decoder(image_feats, memory, memory_padding_mask)
         else:
-            enhanced_features = frame_features
-        
-        # Classification head
-        cls_features = self.classification_head(enhanced_features)
-        cls_features = F.normalize(cls_features, p=2, dim=-1)
-        
-        # Compute similarity with class prototypes
-        cls_scores = {}
-        for class_id, prototype in class_prototypes.items():
-            # Compute cosine similarity
-            similarity = torch.matmul(cls_features, prototype.unsqueeze(-1)).squeeze(-1)
-            cls_scores[class_id] = similarity
-        
-        # Box prediction head
-        boxes = self.box_head(enhanced_features)
-        
-        # Select high-confidence object features for temporal propagation
-        # Concatenate classification scores for all classes
-        all_cls_scores = torch.stack(list(cls_scores.values()), dim=-1)
-        max_scores, _ = all_cls_scores.max(dim=-1)
-        
-        # Create mask for high-confidence objects
-        confidence_mask = max_scores > self.temporal_confidence_threshold
-        
-        # Select corresponding features
-        selected_indices = confidence_mask.nonzero(as_tuple=True)
-        if selected_indices[0].size(0) > 0:
-            object_features = enhanced_features[selected_indices]
-            object_mask = torch.zeros_like(confidence_mask)
-            object_mask[selected_indices] = True
-        else:
-            # If no high-confidence detections, use all features
-            object_features = enhanced_features
-            object_mask = torch.ones_like(confidence_mask)
-        
+            enhanced_feats = image_feats
+
+        # Classification head: V^cls_t = W_cls F^_t (Eq. 5) and cosine similarity (Eq. 6)
+        cls_embeds = self.cls_head.dense0(enhanced_feats)                      # [B, P, D_cls]
+        proto_embeds = self.cls_head.dense0(prototypes)                         # [N, D_cls]
+        similarity = torch.einsum(
+            'bpd,nd->bpn',
+            F.normalize(cls_embeds, dim=-1, eps=1e-6),
+            F.normalize(proto_embeds, dim=-1, eps=1e-6)
+        )
+        logit_shift = self.cls_head.logit_shift(enhanced_feats)
+        logit_scale = self.cls_head.elu(self.cls_head.logit_scale(enhanced_feats)) + 1
+        class_logits = (similarity + logit_shift) * logit_scale                 # [B, P, N]
+        background = self.background_logit.to(class_logits.dtype).expand(*class_logits.shape[:2], 1)
+        logits = torch.cat([class_logits, background], dim=-1).float()
+        probs = logits.softmax(dim=-1)
+
+        # Localisation head (Eq. 7)
+        boxes = self.owl.box_predictor(enhanced_feats, feature_map).float()
+
+        # V^det_t: classification embeddings of patches with max class probability > tau (Eq. 2)
+        next_memory, next_mask, num_memory = self._select_memory(cls_embeds, probs[..., :-1])
+
         return {
-            "cls_scores": cls_scores,
-            "boxes": boxes,
-            "object_features": object_features,
-            "object_mask": object_mask
+            'logits': logits,
+            'probs': probs,
+            'boxes': boxes,
+            'memory': next_memory,
+            'memory_padding_mask': next_mask,
+            'num_memory': num_memory
         }
-    
+
+    def _select_memory(self, cls_embeds: torch.Tensor, class_probs: torch.Tensor):
+        """Select the object tokens propagated to the next frame (at most max_memory_tokens)"""
+        if not self.use_temporal:
+            return None, None, torch.zeros(cls_embeds.size(0), dtype=torch.long, device=cls_embeds.device)
+
+        scores = class_probs.max(dim=-1).values.detach()                        # [B, P]
+        keep = scores > self.temporal_confidence_threshold
+        num_keep = keep.sum(dim=1).clamp(max=self.max_memory_tokens)            # [B]
+        max_keep = int(num_keep.max().item())
+        if max_keep == 0:
+            return None, None, num_keep
+
+        masked_scores = scores.masked_fill(~keep, -1.0)
+        top_scores, top_idx = masked_scores.topk(max_keep, dim=1)               # [B, M]
+        memory = torch.gather(cls_embeds, 1, top_idx[..., None].expand(-1, -1, cls_embeds.size(-1)))
+        padding_mask = top_scores <= self.temporal_confidence_threshold
+        if self.detach_memory:
+            memory = memory.detach()
+        return memory, padding_mask, num_keep
+
+    # ------------------------------------------------------------------
+    # Video forward
+    # ------------------------------------------------------------------
     def forward(
         self,
-        frames: List[torch.Tensor],
-        support_images: Dict[str, List],
-        return_all_frames: bool = True
-    ):
+        query_pixel_values: torch.Tensor,
+        support_pixel_values: torch.Tensor,
+        support_labels: torch.Tensor,
+        num_classes: int
+    ) -> List[Dict[str, torch.Tensor]]:
         """
-        Forward pass for video object detection
-        
+        Forward pass over one episode (frames are processed sequentially so that the
+        object memory of frame t-1 conditions frame t).
+
         Args:
-            frames: List of video frames [T, B, C, H, W]
-            support_images: Dict of support images by class
-            return_all_frames: Whether to return predictions for all frames
-            
+            query_pixel_values: Target video frames [T, 3, S, S]
+            support_pixel_values: Support images [N*K, 3, S, S]
+            support_labels: [N*K] episode class indices
+            num_classes: N
+
         Returns:
-            Dict containing detection results for all frames
+            List (length T) of per-frame outputs (see forward_frame), each with batch size 1
         """
-        # Process support set to get class prototypes
-        class_prototypes = self.process_support_set(support_images)
-        
-        # Process frames sequentially
-        all_frame_outputs = []
-        prev_object_features = None
-        prev_object_mask = None
-        
-        for frame in frames:
-            # Extract features
-            frame_features = self.extract_features(frame)
-            
-            # Process frame with temporal context
+        prototypes = self.compute_prototypes(support_pixel_values, support_labels, num_classes)
+        frame_feats, frame_maps = self.encode_images(query_pixel_values)
+
+        outputs = []
+        memory, memory_mask = None, None
+        for t in range(frame_feats.size(0)):
             frame_output = self.forward_frame(
-                frame_features=frame_features,
-                class_prototypes=class_prototypes,
-                prev_object_features=prev_object_features,
-                prev_object_mask=prev_object_mask
+                frame_feats[t:t + 1], frame_maps[t:t + 1], prototypes, memory, memory_mask
             )
-            
-            # Update previous object features for next frame
-            prev_object_features = frame_output["object_features"]
-            prev_object_mask = frame_output["object_mask"]
-            
-            if return_all_frames:
-                all_frame_outputs.append(frame_output)
-        
-        if return_all_frames:
-            return all_frame_outputs
-        else:
-            # Return only the last frame output
-            return frame_output
-    
+            memory = frame_output['memory']
+            memory_mask = frame_output['memory_padding_mask']
+            outputs.append(frame_output)
+        return outputs
+
+    # ------------------------------------------------------------------
+    # Post-processing
+    # ------------------------------------------------------------------
+    @torch.no_grad()
     def postprocess_detections(
         self,
-        frame_outputs: Dict,
+        frame_output: Dict[str, torch.Tensor],
         image_size: Tuple[int, int],
-        confidence_threshold: Optional[float] = None
-    ):
+        confidence_threshold: Optional[float] = None,
+        max_detections: int = 100,
+        nms_iou: Optional[float] = None
+    ) -> Dict[str, torch.Tensor]:
         """
-        Convert raw model outputs to detection format
-        
+        Convert raw outputs of one frame into detections. Each patch is a candidate whose
+        label is its most probable (non-background) class; it is a valid detection if that
+        probability exceeds the threshold (kappa by default).
+
         Args:
-            frame_outputs: Raw model outputs
-            image_size: Original image size (H, W)
-            confidence_threshold: Confidence threshold for detections
-            
+            frame_output: Output of forward_frame (batch size 1)
+            image_size: Original frame size (H, W)
+            confidence_threshold: Score threshold (default: kappa). Use a low value for AP evaluation.
+            max_detections: Keep at most this many detections (highest scores)
+            nms_iou: Optional class-wise NMS IoU threshold
+
         Returns:
-            Dict containing processed detections (boxes, scores, labels)
+            dict with boxes [D, 4] (xyxy, pixels), scores [D], labels [D] (episode class index)
         """
         if confidence_threshold is None:
             confidence_threshold = self.confidence_threshold
-        
-        cls_scores = frame_outputs["cls_scores"]
-        raw_boxes = frame_outputs["boxes"]
-        
-        # Combine class scores
-        combined_scores = torch.stack(list(cls_scores.values()), dim=-1)
-        max_scores, class_indices = combined_scores.max(dim=-1)
-        
-        # Filter by confidence threshold
-        mask = max_scores > confidence_threshold
-        filtered_scores = max_scores[mask]
-        filtered_class_indices = class_indices[mask]
-        filtered_boxes = raw_boxes[mask]
-        
-        # Convert class indices to class IDs
-        class_id_list = list(cls_scores.keys())
-        filtered_class_ids = [class_id_list[idx] for idx in filtered_class_indices.cpu().numpy()]
-        
-        # Scale boxes to image size
+
+        probs = frame_output['probs'][0, :, :-1]
+        scores, labels = probs.max(dim=-1)
+        boxes = box_cxcywh_to_xyxy(frame_output['boxes'][0])
+
+        # Boxes are relative to the padded square image
         height, width = image_size
-        scaled_boxes = []
-        for box in filtered_boxes:
-            x_center, y_center, w, h = box.cpu().numpy()
-            x1 = (x_center - w/2) * width
-            y1 = (y_center - h/2) * height
-            x2 = (x_center + w/2) * width
-            y2 = (y_center + h/2) * height
-            scaled_boxes.append([x1, y1, x2, y2])
-        
+        boxes = boxes * max(height, width)
+        boxes[:, 0::2] = boxes[:, 0::2].clamp(0, width)
+        boxes[:, 1::2] = boxes[:, 1::2].clamp(0, height)
+
+        keep = scores > confidence_threshold
+        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+        if nms_iou is not None and scores.numel():
+            keep = batched_nms(boxes, scores, labels, nms_iou)
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+        order = scores.argsort(descending=True)[:max_detections]
+
         return {
-            "boxes": scaled_boxes,
-            "scores": filtered_scores.cpu().numpy().tolist(),
-            "labels": filtered_class_ids
+            'boxes': boxes[order].cpu(),
+            'scores': scores[order].cpu(),
+            'labels': labels[order].cpu()
         }
-    
-    def predict_video(
-        self,
-        video_frames: List,
-        support_images: Dict[str, List],
-        confidence_threshold: Optional[float] = None
-    ):
-        """
-        End-to-end video prediction
-        
-        Args:
-            video_frames: List of video frames
-            support_images: Dict of support images by class
-            confidence_threshold: Confidence threshold for detections
-            
-        Returns:
-            List of detection results for each frame
-        """
-        device = next(self.parameters()).device
-        
-        # Process frames in batches
-        frame_outputs = self.forward(
-            frames=video_frames,
-            support_images=support_images,
-            return_all_frames=True
-        )
-        
-        # Postprocess for each frame
-        image_size = video_frames[0].size[-2:]  # Height, Width
-        all_detections = []
-        
-        for frame_idx, frame_output in enumerate(frame_outputs):
-            detections = self.postprocess_detections(
-                frame_output,
-                image_size,
-                confidence_threshold
-            )
-            all_detections.append(detections)
-        
-        return all_detections
+
+    # ------------------------------------------------------------------
+    # Checkpoints (only trainable weights are stored when the encoder is frozen)
+    # ------------------------------------------------------------------
+    def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
+        trainable = {name for name, p in self.named_parameters() if p.requires_grad}
+        return {k: v for k, v in self.state_dict().items() if k in trainable}
+
+    def load_trainable_state_dict(self, state_dict: Dict[str, torch.Tensor]):
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        trainable = {name for name, p in self.named_parameters() if p.requires_grad}
+        missing = [k for k in missing if k in trainable]
+        if missing or unexpected:
+            raise RuntimeError(f"Checkpoint mismatch. Missing: {missing[:10]} Unexpected: {unexpected[:10]}")
+
+
+def load_model_from_checkpoint(checkpoint_path: Optional[str], device: torch.device, **overrides):
+    """
+    Build the model from a checkpoint's saved arguments (overridable) and load its weights.
+    With checkpoint_path=None the untrained (pretrained OWLv2) model is returned.
+    """
+    model_args = {}
+    state_dict = None
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        saved = checkpoint.get('args', {})
+        for key, arg in [('pretrained_model_name', 'pretrained_model'),
+                         ('confidence_threshold', 'conf_threshold'),
+                         ('temporal_confidence_threshold', 'temporal_threshold'),
+                         ('max_memory_tokens', 'max_memory_tokens'),
+                         ('num_attention_heads', 'num_heads')]:
+            if arg in saved:
+                model_args[key] = saved[arg]
+        if 'no_temporal' in saved:
+            model_args['use_temporal'] = not saved['no_temporal']
+        state_dict = checkpoint['model']
+    model_args.update({k: v for k, v in overrides.items() if v is not None})
+    model = FewShotVideoObjectDetection(**model_args)
+    if state_dict is not None:
+        model.load_trainable_state_dict(state_dict)
+    return model.to(device)

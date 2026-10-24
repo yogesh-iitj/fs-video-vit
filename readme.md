@@ -4,149 +4,103 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2602.07801-red)](https://arxiv.org/pdf/2511.13784)
 
 
-This repository contains the implementation of an Object-Aware Temporally Consistent Few-Shot Video Object Detection framework. 
+This repository contains the official implementation of the AAAI'26 paper *Temporal Object-Aware Vision Transformer for Few-Shot Video Object Detection*.
 
 
 ## Project Structure
 
 ```
-├── config.py                # Configuration parameters
-├── dataloader.py            # Few-shot video dataset and dataloader
-├── evaluate.py              # Evaluation script for test set
-├── inference.py             # Inference script for processing videos
-├── model.py                 # Main model architecture
-├── train.py                 # Training script
-└── utils.py                 # Utility functions
+├── config.py           # Configuration parameters
+├── dataloader.py       # Few-shot video dataset and dataloader
+├── model.py            # Model architecture
+├── losses.py           # Training objective
+├── train.py            # Training script
+├── evaluate.py         # Evaluation script
+├── inference.py        # Inference on a video
+├── utils.py            # Utility functions
+└── tools/              # Dataset preparation scripts
 ```
 
 ## Requirements
 
-- Python 3.8+
-- PyTorch 1.12+
-- torchvision
-- transformers
-- opencv-python
-- Pillow
-- numpy
-- tqdm
-- matplotlib
-
-Install dependencies:
-
 ```bash
-pip install -r requirements.txt
+pip install -r requirement.txt
 ```
 
 ## Dataset Format
-
-The dataset should be organized as follows:
 
 ```
 dataset_root/
 ├── videos/
 │   ├── video1/
 │   │   ├── frame1.jpg
-│   │   ├── frame2.jpg
-│   │   └── ...
-│   ├── video2/
 │   │   └── ...
 │   └── ...
 ├── train_annotations.json
 ├── val_annotations.json
-└── test_annotations.json
+├── test_annotations.json
+└── categories.json             # optional: {category_id: name}
 ```
 
-Each annotation file should contain information about videos, frames, and objects in the following format:
+Any few-shot video object detection dataset can be used once converted to this format. Train, validation and test splits contain disjoint object categories (base classes for training, novel classes for validation and testing). Each annotation file has the following format:
 
 ```json
 {
   "video1": {
     "frames": {
       "frame1": {
-        "objects": [
-          {
-            "category_id": "class1",
-            "bbox": [x1, y1, x2, y2]
-          },
-          ...
-        ]
+        "file_name": "video1/frame1.jpg",
+        "objects": [{"category_id": "class1", "bbox": [x1, y1, x2, y2]}, ...]
       },
-      "frame2": {
-        ...
-      }
+      ...
     }
   },
-  "video2": {
-    ...
-  }
+  ...
 }
 ```
 
 ## Training
 
-To train the model:
-
 ```bash
 python train.py \
   --data_dir /path/to/dataset \
-  --n_way 5 \
-  --k_shot 5 \
-  --max_frames 16 \
-  --pretrained_model google/owlv2-large-patch16 \
-  --conf_threshold 0.5 \
-  --temporal_threshold 0.94 \
-  --batch_size 1 \
-  --epochs 50 \
-  --lr 1e-5 \
-  --weight_decay 0.01 \
-  --lambda_cls 2.0 \
-  --lambda_box 5.0 \
-  --img_size 640 \
-  --output_dir outputs
+  --pretrained_model google/owlv2-large-patch14-ensemble \
+  --n_way 5 --k_shot 5 --max_frames 8 \
+  --epochs 20 --episodes_per_epoch 500 \
+  --temporal_threshold 0.94 --conf_threshold 0.98 \
+  --lr 1e-5 --weight_decay 0.01 --lambda_cls 2.0 --lambda_box 5.0 \
+  --output_dir outputs --run_name my_run
 ```
 
 ## Evaluation
 
-To evaluate the model on the test set:
-
 ```bash
 python evaluate.py \
-  --data_dir /path/to/dataset \
-  --n_way 5 \
-  --k_shot 5 \
-  --checkpoint_path outputs/best_model.pt \
-  --pretrained_model google/owlv2-large-patch16 \
-  --conf_threshold 0.5 \
-  --temporal_threshold 0.94 \
-  --visualize \
-  --plot_results
+  --data_dir /path/to/dataset --split test \
+  --n_way 5 --k_shot 5 \
+  --checkpoint_path outputs/my_run/best_model.pt \
+  --visualize --plot_results
 ```
 
 ## Inference
-
-To run inference on a video:
 
 ```bash
 python inference.py \
   --video_path /path/to/video.mp4 \
   --support_folder /path/to/support_images \
   --output_path output_video.mp4 \
-  --checkpoint_path outputs/best_model.pt \
-  --pretrained_model google/owlv2-large-patch16 \
-  --conf_threshold 0.5
+  --checkpoint_path outputs/my_run/best_model.pt
 ```
 
-The support folder should be organized as follows, with one subfolder per class:
+The support folder has one subfolder of images per class:
 
 ```
 support_images/
 ├── class1/
 │   ├── image1.jpg
-│   ├── image2.jpg
 │   └── ...
-├── class2/
-│   └── ...
-└── ...
+└── class2/
+    └── ...
 ```
 
 
@@ -165,4 +119,3 @@ If you find this work useful, please consider citing it as:
 ## Acknowledgements
 
 - This implementation uses the [Hugging Face Transformers](https://github.com/huggingface/transformers) library for pretrained OWL-ViT models.
-

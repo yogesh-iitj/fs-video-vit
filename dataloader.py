@@ -1,37 +1,57 @@
 import os
+import re
+import json
 import random
 import torch
-import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import torchvision.transforms as transforms
 from typing import Dict, List, Tuple, Optional
-import json
-import cv2
 from pathlib import Path
+
+from utils import owl_preprocess
+
+# Episodes contain many small tensors (per-frame targets); passing each through its own file
+# descriptor exhausts the open-file limit after a few hundred episodes
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+
+def _natural_key(text: str):
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r'(\d+)', str(text))]
+
 
 class FSVODDataset(Dataset):
     """
     Few-Shot Video Object Detection Dataset
-    
-    This dataset implements N-way K-shot learning for video object detection.
+
     Each episode consists of:
-    - Support set: N classes with K examples each
-    - Query set: A video sequence with frames containing objects of the N classes
+    - Support set: N classes with K object crops each (from other videos than the query)
+    - Query set: a clip of a video, annotated with the objects of those N classes
+
+    The classes of a split are the categories annotated in its annotation file, so base
+    (train) and novel (val/test) classes are defined by how the files were built; they
+    should be disjoint.
+
+    Training episodes are sampled randomly: a video, a clip of max_frames annotated frames
+    containing objects, its classes (at most N) plus negative classes up to N. Evaluation
+    episodes are fixed: every video of the split is evaluated, with all of its classes
+    (in groups of N) and every annotated frame (or the first max_frames when max_frames > 0).
     """
-    
+
     def __init__(
         self,
         root_dir: str,
         split: str = 'train',
         n_way: int = 5,
         k_shot: int = 5,
-        max_frames: int = 16,
+        max_frames: int = 8,
         frame_stride: int = 1,
-        transform=None,
-        target_size: Tuple[int, int] = (640, 640),
-        episode_length: int = 100,
-        seed: int = 42
+        image_size: int = 1008,
+        episode_length: int = 1000,
+        seed: int = 42,
+        support_context: float = 0.1,
+        min_support_size: int = 16,
+        training: Optional[bool] = None,
+        max_videos: int = 0
     ):
         """
         Args:
@@ -39,12 +59,15 @@ class FSVODDataset(Dataset):
             split: Dataset split ('train', 'val', 'test')
             n_way: Number of classes per episode
             k_shot: Number of support examples per class
-            max_frames: Maximum number of frames per video
+            max_frames: Frames per training clip; for evaluation, 0 = all annotated frames
             frame_stride: Stride for sampling frames
-            transform: Image transformations
-            target_size: Target size for resizing images (H, W)
-            episode_length: Number of episodes in an epoch
-            seed: Random seed for reproducibility
+            image_size: Model input size (960 for OWLv2-B/16, 1008 for OWLv2-L/14)
+            episode_length: Number of (random) episodes per epoch for training
+            seed: Random seed for the fixed evaluation episodes
+            support_context: Context added around support boxes, as a fraction of box size
+            min_support_size: Minimum box side (pixels) of a support example
+            training: Random episodes + augmentation (default: split == 'train')
+            max_videos: Use at most this many videos (0 = all), e.g. for quick validation
         """
         self.root_dir = Path(root_dir)
         self.split = split
@@ -52,424 +75,283 @@ class FSVODDataset(Dataset):
         self.k_shot = k_shot
         self.max_frames = max_frames
         self.frame_stride = frame_stride
-        self.target_size = target_size
+        self.image_size = image_size
         self.episode_length = episode_length
-        
-        # Set random seed for reproducibility
-        random.seed(seed)
-        
-        # Default transform if none provided
-        if transform is None:
-            self.transform = transforms.Compose([
-                transforms.Resize(target_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-        else:
-            self.transform = transform
-            
-        # Load annotation files
-        self.annotations = self._load_annotations()
-        
-        # Get all available classes
-        self.all_classes = self._get_all_classes()
-        
-        # Split classes into base and novel based on split
-        self.base_classes, self.novel_classes = self._split_classes()
-        
-        # For test and val, we use fixed episodes
-        if split in ['test', 'val']:
-            self.episodes = self._generate_episodes()
-        else:
+        self.support_context = support_context
+        self.min_support_size = min_support_size
+        self.training = (split == 'train') if training is None else training
+
+        self.videos = self._load_annotations(max_videos, seed)
+        self._index_classes()
+
+        if self.training:
             self.episodes = None
-    
-    def _load_annotations(self):
-        """Load dataset annotations"""
+        else:
+            self.episodes = self._generate_episodes(random.Random(seed))
+
+    # ------------------------------------------------------------------
+    # Annotations
+    # ------------------------------------------------------------------
+    def _load_annotations(self, max_videos: int, seed: int):
+        """
+        Load annotations: {video_id: {"frames": {frame_id: {"objects": [{"category_id", "bbox" (xyxy)}],
+        "file_name" (optional, relative to <root>/videos)}}}}
+        """
         annotation_file = self.root_dir / f"{self.split}_annotations.json"
-        
         if not annotation_file.exists():
             raise FileNotFoundError(f"Annotation file {annotation_file} not found")
-        
         with open(annotation_file, 'r') as f:
             annotations = json.load(f)
-        
-        return annotations
-    
-    def _get_all_classes(self):
-        """Get all available classes in the dataset"""
-        classes = set()
-        
-        for video_id, video_info in self.annotations.items():
-            for frame_id, frame_info in video_info['frames'].items():
-                for obj in frame_info['objects']:
-                    classes.add(obj['category_id'])
-        
-        return sorted(list(classes))
-    
-    def _split_classes(self):
-        """Split classes into base and novel based on split"""
-        # For simplicity, we use a deterministic split based on class IDs
-        # In practice, this should be defined by the dataset
-        all_classes = self.all_classes
-        n_classes = len(all_classes)
-        
-        # 60% for base classes, 20% for validation, 20% for testing
-        n_base = int(n_classes * 0.6)
-        n_val = int(n_classes * 0.2)
-        
-        if self.split == 'train':
-            # Base classes for training
-            return all_classes[:n_base], []
-        elif self.split == 'val':
-            # Novel classes for validation
-            return all_classes[:n_base], all_classes[n_base:n_base+n_val]
-        else:  # test
-            # Novel classes for testing
-            return all_classes[:n_base], all_classes[n_base+n_val:]
-    
-    def _get_support_examples(self, class_id):
-        """Get support examples for a specific class"""
-        examples = []
-        
-        # Find all objects of this class in the dataset
-        for video_id, video_info in self.annotations.items():
-            for frame_id, frame_info in video_info['frames'].items():
-                for obj in frame_info['objects']:
-                    if obj['category_id'] == class_id:
-                        # Add this frame as a support example
-                        examples.append({
-                            'video_id': video_id,
-                            'frame_id': frame_id,
-                            'bbox': obj['bbox']  # [x1, y1, x2, y2]
-                        })
-        
-        # Randomly select k_shot examples
-        if len(examples) >= self.k_shot:
-            return random.sample(examples, self.k_shot)
-        else:
-            # If not enough examples, sample with replacement
-            return random.choices(examples, k=self.k_shot)
-    
-    def _get_query_video(self, class_ids):
-        """Get a query video containing objects of the selected classes"""
-        valid_videos = []
-        
-        # Find videos containing all selected classes
-        for video_id, video_info in self.annotations.items():
-            video_classes = set()
-            
-            for frame_info in video_info['frames'].values():
-                for obj in frame_info['objects']:
-                    video_classes.add(obj['category_id'])
-            
-            # Check if this video contains all selected classes
-            if all(cls_id in video_classes for cls_id in class_ids):
-                valid_videos.append(video_id)
-        
-        # If no valid videos, relax constraint to contain at least one class
-        if not valid_videos:
-            valid_videos = []
-            for video_id, video_info in self.annotations.items():
-                video_classes = set()
-                
-                for frame_info in video_info['frames'].values():
-                    for obj in frame_info['objects']:
-                        video_classes.add(obj['category_id'])
-                
-                # Check if this video contains at least one selected class
-                if any(cls_id in video_classes for cls_id in class_ids):
-                    valid_videos.append(video_id)
-        
-        # Randomly select a video
-        if valid_videos:
-            selected_video_id = random.choice(valid_videos)
-            return self._prepare_query_video(selected_video_id, class_ids)
-        else:
-            # Fallback: just select any video
-            selected_video_id = random.choice(list(self.annotations.keys()))
-            return self._prepare_query_video(selected_video_id, class_ids)
-    
-    def _prepare_query_video(self, video_id, class_ids):
-        """Prepare query video by selecting appropriate frames"""
-        video_info = self.annotations[video_id]
-        
-        # Sort frames by ID
-        frame_ids = sorted(video_info['frames'].keys())
-        
-        # Select frames with stride
-        selected_frames = frame_ids[::self.frame_stride]
-        
-        # Limit to max_frames
-        if len(selected_frames) > self.max_frames:
-            if self.split in ['test', 'val']:
-                # For test/val, take first max_frames
-                selected_frames = selected_frames[:self.max_frames]
-            else:
-                # For train, randomly select max_frames
-                selected_frames = sorted(random.sample(selected_frames, self.max_frames))
-        
-        # Prepare frame data
-        frames_data = []
-        for frame_id in selected_frames:
-            frame_info = video_info['frames'][frame_id]
-            
-            # Filter objects by selected classes
-            objects = [obj for obj in frame_info['objects'] if obj['category_id'] in class_ids]
-            
-            frames_data.append({
-                'frame_id': frame_id,
-                'image_path': os.path.join(self.root_dir, 'videos', video_id, f"{frame_id}.jpg"),
-                'objects': objects
-            })
-        
-        return {
-            'video_id': video_id,
-            'frames': frames_data
-        }
-    
-    def _generate_episodes(self):
-        """Generate fixed episodes for validation and testing"""
+
+        videos = []
+        for video_id in sorted(annotations.keys(), key=_natural_key):
+            frames = []
+            frame_dict = annotations[video_id]['frames']
+            for frame_id in sorted(frame_dict.keys(), key=_natural_key):
+                frame_info = frame_dict[frame_id]
+                file_name = frame_info.get('file_name', os.path.join(video_id, f"{frame_id}.jpg"))
+                objects = [{'category_id': str(obj['category_id']), 'bbox': [float(v) for v in obj['bbox']]}
+                           for obj in frame_info['objects']]
+                frames.append({
+                    'frame_id': frame_id,
+                    'image_path': str(self.root_dir / 'videos' / file_name),
+                    'objects': objects
+                })
+            if frames:
+                videos.append({'video_id': video_id, 'frames': frames})
+
+        if max_videos and len(videos) > max_videos:
+            videos = sorted(random.Random(seed).sample(videos, max_videos), key=lambda v: _natural_key(v['video_id']))
+        return videos
+
+    def _index_classes(self):
+        """Index support instances and videos per class"""
+        self.class_instances = {}
+        self.class_videos = {}
+        for v_idx, video in enumerate(self.videos):
+            for f_idx, frame in enumerate(video['frames']):
+                for obj in frame['objects']:
+                    cls_id = obj['category_id']
+                    self.class_videos.setdefault(cls_id, set()).add(v_idx)
+                    x1, y1, x2, y2 = obj['bbox']
+                    if min(x2 - x1, y2 - y1) >= self.min_support_size:
+                        self.class_instances.setdefault(cls_id, []).append((v_idx, f_idx, obj['bbox']))
+        # Only classes with at least one usable support example can form episodes
+        self.all_classes = sorted(self.class_instances.keys(), key=_natural_key)
+
+    # ------------------------------------------------------------------
+    # Episode construction
+    # ------------------------------------------------------------------
+    def _sample_support(self, cls_id: str, query_video_idx: int, rng: random.Random):
+        """Sample K support instances of a class, preferring videos other than the query video"""
+        instances = self.class_instances[cls_id]
+        others = [inst for inst in instances if inst[0] != query_video_idx]
+        pool = others if others else instances
+        if len(pool) >= self.k_shot:
+            return rng.sample(pool, self.k_shot)
+        return [rng.choice(pool) for _ in range(self.k_shot)]
+
+    def _complete_classes(self, positive: List[str], rng: random.Random):
+        """Add negative (absent) classes until the episode has N classes"""
+        classes = list(positive)
+        negatives = [c for c in self.all_classes if c not in classes]
+        rng.shuffle(negatives)
+        classes += negatives[:max(0, self.n_way - len(classes))]
+        rng.shuffle(classes)
+        return classes
+
+    def _frame_classes(self, video, frame_indices):
+        classes = []
+        for f_idx in frame_indices:
+            for obj in video['frames'][f_idx]['objects']:
+                if obj['category_id'] in self.class_instances and obj['category_id'] not in classes:
+                    classes.append(obj['category_id'])
+        return classes
+
+    def _sample_train_episode(self, rng: random.Random):
+        video_idx = rng.randrange(len(self.videos))
+        video = self.videos[video_idx]
+        num_frames = len(video['frames'])
+        span = (self.max_frames - 1) * self.frame_stride + 1 if self.max_frames > 0 else num_frames
+        start = rng.randrange(max(1, num_frames - span + 1))
+        frame_indices = list(range(start, min(num_frames, start + span), self.frame_stride))
+
+        positive = self._frame_classes(video, frame_indices)
+        if not positive:
+            return self._sample_train_episode(rng)
+        rng.shuffle(positive)
+        classes = self._complete_classes(positive[:self.n_way], rng)
+        support = {c: self._sample_support(c, video_idx, rng) for c in classes}
+        return {'video_idx': video_idx, 'frame_indices': frame_indices, 'classes': classes, 'support': support}
+
+    def _generate_episodes(self, rng: random.Random):
+        """Fixed evaluation episodes covering every video and every annotated class"""
         episodes = []
-        
-        # Available classes for this split
-        available_classes = self.novel_classes if self.novel_classes else self.base_classes
-        
-        for _ in range(self.episode_length):
-            # Randomly select n_way classes
-            if len(available_classes) >= self.n_way:
-                episode_classes = random.sample(available_classes, self.n_way)
-            else:
-                # If not enough classes, sample with replacement
-                episode_classes = random.choices(available_classes, k=self.n_way)
-            
-            # Get support examples for each class
-            support_set = {}
-            for cls_id in episode_classes:
-                support_set[cls_id] = self._get_support_examples(cls_id)
-            
-            # Get query video
-            query_video = self._get_query_video(episode_classes)
-            
-            episodes.append({
-                'classes': episode_classes,
-                'support_set': support_set,
-                'query_video': query_video
-            })
-        
+        for video_idx, video in enumerate(self.videos):
+            frame_indices = list(range(0, len(video['frames']), self.frame_stride))
+            if self.max_frames > 0:
+                frame_indices = frame_indices[:self.max_frames]
+            positive = self._frame_classes(video, frame_indices)
+            for start in range(0, len(positive), self.n_way):
+                classes = self._complete_classes(positive[start:start + self.n_way], rng)
+                support = {c: self._sample_support(c, video_idx, rng) for c in classes}
+                episodes.append({'video_idx': video_idx, 'frame_indices': frame_indices,
+                                 'classes': classes, 'support': support})
         return episodes
-    
-    def _load_image(self, image_path, bbox=None):
-        """Load and preprocess an image, optionally cropping to bbox"""
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _open_image(path):
+        """Open an image; returns None for missing / corrupt files"""
         try:
-            image = Image.open(image_path).convert('RGB')
-            
-            if bbox is not None:
-                # Crop to bounding box
-                x1, y1, x2, y2 = bbox
-                image = image.crop((x1, y1, x2, y2))
-            
-            # Apply transformations
-            if self.transform:
-                image = self.transform(image)
-            
-            return image
-        except Exception as e:
-            print(f"Error loading image {image_path}: {e}")
-            # Return empty tensor as fallback
-            return torch.zeros((3, *self.target_size))
-    
-    def _prepare_episode(self, idx):
-        """Prepare an episode (support set + query video)"""
-        if self.split in ['test', 'val'] and self.episodes is not None:
-            # Use pre-generated episodes for test/val
-            episode = self.episodes[idx % len(self.episodes)]
-        else:
-            # Generate dynamic episode for training
-            # Available classes for this split
-            available_classes = self.novel_classes if self.novel_classes else self.base_classes
-            
-            # Randomly select n_way classes
-            if len(available_classes) >= self.n_way:
-                episode_classes = random.sample(available_classes, self.n_way)
-            else:
-                # If not enough classes, sample with replacement
-                episode_classes = random.choices(available_classes, k=self.n_way)
-            
-            # Get support examples for each class
-            support_set = {}
-            for cls_id in episode_classes:
-                support_set[cls_id] = self._get_support_examples(cls_id)
-            
-            # Get query video
-            query_video = self._get_query_video(episode_classes)
-            
-            episode = {
-                'classes': episode_classes,
-                'support_set': support_set,
-                'query_video': query_video
-            }
-        
-        # Load support images
-        support_images = {}
-        for cls_id, examples in episode['support_set'].items():
-            cls_images = []
-            for example in examples:
-                image_path = os.path.join(
-                    self.root_dir, 'videos', example['video_id'], f"{example['frame_id']}.jpg"
-                )
-                # Load image and crop to object
-                image = self._load_image(image_path, example['bbox'])
-                cls_images.append(image)
-            support_images[cls_id] = torch.stack(cls_images)
-        
-        # Load query video frames
-        query_frames = []
-        frame_annotations = []
-        
-        for frame_data in episode['query_video']['frames']:
-            # Load frame image
-            frame = self._load_image(frame_data['image_path'])
-            query_frames.append(frame)
-            
-            # Prepare annotations
-            objects = []
-            for obj in frame_data['objects']:
-                if obj['category_id'] in episode['classes']:
-                    objects.append({
-                        'category_id': obj['category_id'],
-                        'bbox': obj['bbox']  # [x1, y1, x2, y2] format
-                    })
-            
-            frame_annotations.append({
-                'frame_id': frame_data['frame_id'],
-                'objects': objects
+            with Image.open(path) as image:
+                return image.convert('RGB')
+        except (OSError, ValueError) as e:
+            print(f"Warning: skipping unreadable image {path}: {e}")
+            return None
+
+    def _load_support_crop(self, video_idx, frame_idx, bbox, flip: bool):
+        image = self._open_image(self.videos[video_idx]['frames'][frame_idx]['image_path'])
+        if image is None:
+            return None
+        x1, y1, x2, y2 = bbox
+        pad_w = (x2 - x1) * self.support_context
+        pad_h = (y2 - y1) * self.support_context
+        crop = image.crop((
+            max(0, int(x1 - pad_w)), max(0, int(y1 - pad_h)),
+            min(image.width, int(round(x2 + pad_w))), min(image.height, int(round(y2 + pad_h)))
+        ))
+        if flip:
+            crop = crop.transpose(Image.FLIP_LEFT_RIGHT)
+        return owl_preprocess(crop, self.image_size)
+
+    def _prepare_episode(self, episode, rng: Optional[random.Random]):
+        flip_video = self.training and rng.random() < 0.5
+        classes = episode['classes']
+        class_to_idx = {c: i for i, c in enumerate(classes)}
+
+        # Support set
+        support_pixel_values, support_labels = [], []
+        for cls_id in classes:
+            for video_idx, frame_idx, bbox in episode['support'][cls_id]:
+                flip = self.training and rng.random() < 0.5
+                crop = self._load_support_crop(video_idx, frame_idx, bbox, flip)
+                # Unreadable frame: use the first readable instance of the class instead
+                for fallback in self.class_instances[cls_id]:
+                    if crop is not None:
+                        break
+                    crop = self._load_support_crop(*fallback, flip)
+                support_pixel_values.append(crop)
+                support_labels.append(class_to_idx[cls_id])
+
+        # Query frames and targets
+        video = self.videos[episode['video_idx']]
+        query_pixel_values, targets, frame_ids, image_sizes = [], [], [], []
+        for f_idx in episode['frame_indices']:
+            frame = video['frames'][f_idx]
+            image = self._open_image(frame['image_path'])
+            if image is None:
+                continue
+            width, height = image.size
+            if flip_video:
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            query_pixel_values.append(owl_preprocess(image, self.image_size))
+
+            boxes, labels, category_ids = [], [], []
+            for obj in frame['objects']:
+                if obj['category_id'] not in class_to_idx:
+                    continue
+                x1, y1, x2, y2 = obj['bbox']
+                x1, x2 = max(0.0, x1), min(float(width), x2)
+                y1, y2 = max(0.0, y1), min(float(height), y2)
+                if x2 - x1 < 1 or y2 - y1 < 1:
+                    continue
+                if flip_video:
+                    x1, x2 = width - x2, width - x1
+                boxes.append([x1, y1, x2, y2])
+                labels.append(class_to_idx[obj['category_id']])
+                category_ids.append(obj['category_id'])
+
+            boxes_xyxy = torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+            side = float(max(width, height))
+            norm = boxes_xyxy / side
+            boxes_cxcywh = torch.stack([(norm[:, 0] + norm[:, 2]) / 2, (norm[:, 1] + norm[:, 3]) / 2,
+                                        norm[:, 2] - norm[:, 0], norm[:, 3] - norm[:, 1]], dim=-1)
+            targets.append({
+                'boxes': boxes_cxcywh,                     # normalised cxcywh (padded square)
+                'labels': torch.tensor(labels, dtype=torch.long),
+                'boxes_xyxy': boxes_xyxy,                  # pixels in the original frame
+                'category_ids': category_ids
             })
-        
-        query_frames = torch.stack(query_frames) if query_frames else torch.zeros((0, 3, *self.target_size))
-        
+            frame_ids.append(frame['frame_id'])
+            image_sizes.append((height, width))
+
         return {
-            'support_images': support_images,  # Dict[class_id -> Tensor[K, 3, H, W]]
-            'query_frames': query_frames,      # Tensor[T, 3, H, W]
-            'frame_annotations': frame_annotations,  # List[Dict] annotations for each frame
-            'classes': episode['classes']      # List of class IDs in this episode
+            'support_pixel_values': torch.stack(support_pixel_values),   # [N*K, 3, S, S]
+            'support_labels': torch.tensor(support_labels, dtype=torch.long),
+            'query_pixel_values': (torch.stack(query_pixel_values) if query_pixel_values
+                                   else torch.zeros(0, 3, self.image_size, self.image_size)),  # [T, 3, S, S]
+            'targets': targets,
+            'classes': classes,                                          # category id of each class index
+            'video_id': video['video_id'],
+            'frame_ids': frame_ids,
+            'image_sizes': image_sizes
         }
-    
+
     def __len__(self):
-        """Return the number of episodes in the dataset"""
-        return self.episode_length
-    
+        return self.episode_length if self.training else len(self.episodes)
+
     def __getitem__(self, idx):
-        """Get an episode"""
-        return self._prepare_episode(idx)
+        if not self.training:
+            return self._prepare_episode(self.episodes[idx], None)
+        while True:
+            rng = random.Random(random.getrandbits(64))
+            episode = self._prepare_episode(self._sample_train_episode(rng), rng)
+            if len(episode['targets']):
+                return episode
 
 
 def collate_episodes(batch):
     """
-    Custom collate function for episode batches
-    
-    Args:
-        batch: List of episodes from dataset __getitem__
-        
-    Returns:
-        Batched episode data
+    Each element is a complete episode and episodes are processed one at a time,
+    so simply return the first item
     """
-    # Since each element in batch is already a complete episode,
-    # and we process one episode at a time, simply return the first item
     return batch[0]
 
 
-def get_fsvod_loaders(
+def get_fsvod_loader(
     root_dir: str,
+    split: str,
     n_way: int = 5,
     k_shot: int = 5,
-    max_frames: int = 16,
-    batch_size: int = 1,
+    max_frames: int = 8,
+    frame_stride: int = 1,
+    image_size: int = 1008,
+    episode_length: int = 1000,
     num_workers: int = 4,
-    target_size: Tuple[int, int] = (640, 640)
-):
-    """
-    Get dataloaders for all splits
-    
-    Args:
-        root_dir: Root directory of the dataset
-        n_way: Number of classes per episode
-        k_shot: Number of support examples per class
-        max_frames: Maximum number of frames per video
-        batch_size: Batch size (typically 1 for episodes)
-        num_workers: Number of workers for dataloader
-        target_size: Target size for resizing images (H, W)
-        
-    Returns:
-        Dict containing dataloaders for train, val, and test splits
-    """
-    # Define transforms
-    transform = transforms.Compose([
-        transforms.Resize(target_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    # Create datasets
-    train_dataset = FSVODDataset(
+    seed: int = 42,
+    max_videos: int = 0
+) -> DataLoader:
+    """Dataloader for one split (episodes are not batched: batch size 1)"""
+    dataset = FSVODDataset(
         root_dir=root_dir,
-        split='train',
+        split=split,
         n_way=n_way,
         k_shot=k_shot,
         max_frames=max_frames,
-        transform=transform,
-        target_size=target_size
+        frame_stride=frame_stride,
+        image_size=image_size,
+        episode_length=episode_length,
+        seed=seed,
+        max_videos=max_videos
     )
-    
-    val_dataset = FSVODDataset(
-        root_dir=root_dir,
-        split='val',
-        n_way=n_way,
-        k_shot=k_shot,
-        max_frames=max_frames,
-        transform=transform,
-        target_size=target_size
-    )
-    
-    test_dataset = FSVODDataset(
-        root_dir=root_dir,
-        split='test',
-        n_way=n_way,
-        k_shot=k_shot,
-        max_frames=max_frames,
-        transform=transform,
-        target_size=target_size
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_episodes,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
+    return DataLoader(
+        dataset,
+        batch_size=1,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_episodes,
-        pin_memory=True
+        persistent_workers=dataset.training and num_workers > 0
     )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_episodes,
-        pin_memory=True
-    )
-    
-    return {
-        'train': train_loader,
-        'val': val_loader,
-        'test': test_loader
-    }
